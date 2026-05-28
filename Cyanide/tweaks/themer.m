@@ -301,6 +301,91 @@ static NSData *themer_rounded_png_data(NSData *bytes, const char *label)
     }
 }
 
+static NSData *themer_upload_png_data(NSData *bytes, const char *label)
+{
+    if (themer_host_ios_major() == 16) return bytes;
+    return themer_rounded_png_data(bytes, label);
+}
+
+static void themer_log_decode_failure(const char *label,
+                                      NSData *bytes,
+                                      uint64_t nsdata,
+                                      uint64_t remoteBuf)
+{
+    uint64_t remoteLen = r_is_objc_ptr(nsdata)
+        ? r_msg2(nsdata, "length", 0, 0, 0, 0)
+        : 0;
+    uint8_t head[8] = {0};
+    uint8_t tail[8] = {0};
+    bool headOK = remote_read(remoteBuf, head, sizeof(head));
+    bool tailOK = false;
+    if (bytes.length >= sizeof(tail)) {
+        tailOK = remote_read(remoteBuf + bytes.length - sizeof(tail),
+                             tail,
+                             sizeof(tail));
+    }
+    printf("[THEMER] UIImage decode failed in SpringBoard for %s localLen=%lu nsdataLen=%llu headOK=%d head=%02x%02x%02x%02x%02x%02x%02x%02x tailOK=%d tail=%02x%02x%02x%02x%02x%02x%02x%02x\n",
+           label ?: "?",
+           (unsigned long)bytes.length,
+           (unsigned long long)remoteLen,
+           headOK ? 1 : 0,
+           head[0], head[1], head[2], head[3], head[4], head[5], head[6], head[7],
+           tailOK ? 1 : 0,
+           tail[0], tail[1], tail[2], tail[3], tail[4], tail[5], tail[6], tail[7]);
+}
+
+static NSString *themer_ios16_cache_path_for_png(NSData *bytes, const char *label)
+{
+    if (!bytes || bytes.length == 0) return nil;
+
+    @autoreleasepool {
+        NSArray<NSString *> *dirs =
+            NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+        NSString *docs = dirs.firstObject ?: NSHomeDirectory();
+        NSString *dir = [docs stringByAppendingPathComponent:@"CyanideThemerCache"];
+        if (![NSFileManager.defaultManager createDirectoryAtPath:dir
+                                     withIntermediateDirectories:YES
+                                                      attributes:nil
+                                                           error:nil]) {
+            return nil;
+        }
+
+        NSString *name = label ? [NSString stringWithUTF8String:label] : @"unknown";
+        NSCharacterSet *bad = [[NSCharacterSet characterSetWithCharactersInString:
+            @"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"] invertedSet];
+        name = [[name componentsSeparatedByCharactersInSet:bad] componentsJoinedByString:@"_"];
+        if (name.length == 0) name = @"unknown";
+
+        NSString *path = [dir stringByAppendingPathComponent:
+            [NSString stringWithFormat:@"%@-%lu.png", name, (unsigned long)bytes.length]];
+        if (![bytes writeToFile:path atomically:YES]) return nil;
+        return path;
+    }
+}
+
+static uint64_t themer_build_ios16_uiimage_from_file(NSData *bytes, const char *label, uint64_t UIImageCls)
+{
+    NSString *path = themer_ios16_cache_path_for_png(bytes, label);
+    if (path.length == 0) return 0;
+
+    uint64_t nsPath = r_nsstr_retained(path.UTF8String);
+    if (!r_is_objc_ptr(nsPath)) return 0;
+    uint64_t image = r_msg2_main(UIImageCls, "imageWithContentsOfFile:", nsPath, 0, 0, 0);
+    if (r_is_objc_ptr(image)) {
+        r_msg2(image, "retain", 0, 0, 0, 0);
+        printf("[THEMER] iOS16 file decode succeeded for %s path=%s image=0x%llx\n",
+               label ?: "?",
+               path.UTF8String,
+               (unsigned long long)image);
+    } else {
+        printf("[THEMER] iOS16 file decode failed for %s path=%s\n",
+               label ?: "?",
+               path.UTF8String);
+    }
+    r_msg2(nsPath, "release", 0, 0, 0, 0);
+    return image;
+}
+
 static double themer_screen_scale(void)
 {
     double scale = 3.0;
@@ -539,24 +624,34 @@ static uint64_t themer_build_remote_uiimage_from_data(NSData *bytes, const char 
     uint64_t nsdata = r_is_objc_ptr(dataAlloc)
         ? r_msg2(dataAlloc, "initWithBytes:length:", remoteBuf, bytes.length, 0, 0)
         : 0;
-    r_free(remoteBuf);  // NSData copied the bytes
 
     if (!r_is_objc_ptr(nsdata)) {
         printf("[THEMER] NSData init failed label=%s\n", label ?: "?");
+        r_free(remoteBuf);
         return 0;
     }
 
-    uint64_t image = r_msg2(UIImageCls, "imageWithData:", nsdata, 0, 0, 0);
+    uint64_t image = themer_host_ios_major() == 16
+        ? r_msg2_main(UIImageCls, "imageWithData:", nsdata, 0, 0, 0)
+        : r_msg2(UIImageCls, "imageWithData:", nsdata, 0, 0, 0);
     if (r_is_objc_ptr(image)) {
         r_msg2(image, "retain", 0, 0, 0, 0);
     }
-    r_msg2(nsdata, "release", 0, 0, 0, 0);
 
     if (!r_is_objc_ptr(image)) {
-        printf("[THEMER] UIImage decode failed for %s (PNG malformed?)\n",
-               label ?: "?");
+        if (themer_host_ios_major() == 16) {
+            image = themer_build_ios16_uiimage_from_file(bytes, label, UIImageCls);
+        }
+    }
+
+    if (!r_is_objc_ptr(image)) {
+        themer_log_decode_failure(label, bytes, nsdata, remoteBuf);
+        r_msg2(nsdata, "release", 0, 0, 0, 0);
+        r_free(remoteBuf);
         return 0;
     }
+    r_msg2(nsdata, "release", 0, 0, 0, 0);
+    r_free(remoteBuf);
     return image;
 }
 
@@ -669,6 +764,12 @@ static bool themer_should_pin_dynamic_overlay(const char *bundle, uint64_t iconV
            strstr(cls, "Calendar") != NULL;
 }
 
+static bool themer_should_pin_visible_overlay(const char *bundle, uint64_t iconView)
+{
+    if (themer_should_pin_dynamic_overlay(bundle, iconView)) return true;
+    return false;
+}
+
 static bool themer_prefers_view_level_overlay(const char *bundle)
 {
     if (bundle &&
@@ -688,6 +789,60 @@ static bool themer_needs_visible_push(const char *bundle)
     // visible setter path.
     int major = themer_host_ios_major();
     return major > 0 && major < 26;
+}
+
+static int themer_push_ios16_layer_contents(uint64_t iconView, uint64_t image)
+{
+    if (themer_host_ios_major() != 16 ||
+        !r_is_objc_ptr(iconView) ||
+        !r_is_objc_ptr(image)) {
+        return 0;
+    }
+
+    uint64_t iiv = themer_icon_image_view_for_iconview(iconView);
+    uint64_t layer = (r_is_objc_ptr(iiv) && r_responds_main(iiv, "layer"))
+        ? r_msg2_main(iiv, "layer", 0, 0, 0, 0) : 0;
+    uint64_t cgImage = r_responds_main(image, "CGImage")
+        ? r_msg2_main(image, "CGImage", 0, 0, 0, 0) : 0;
+    if (!r_is_objc_ptr(layer) || !cgImage || !r_responds_main(layer, "setContents:")) {
+        return 0;
+    }
+
+    r_msg2_main(layer, "setContents:", cgImage, 0, 0, 0);
+    if (r_responds_main(layer, "setMasksToBounds:")) {
+        r_msg2_main(layer, "setMasksToBounds:", 1, 0, 0, 0);
+    }
+
+    struct { double x, y, w, h; } b = {0};
+    double radius = 15.0;
+    if (r_responds_main(layer, "bounds") &&
+        r_msg2_main_struct_ret(layer, "bounds",
+            &b, sizeof(b),
+            NULL, 0, NULL, 0, NULL, 0, NULL, 0) &&
+        b.w > 0.0) {
+        radius = b.w * 0.225;
+    }
+    if (r_responds_main(layer, "setCornerRadius:")) {
+        r_msg2_main_raw(layer, "setCornerRadius:",
+            &radius, sizeof(radius),
+            NULL, 0, NULL, 0, NULL, 0);
+    }
+
+    static bool logged = false;
+    if (!logged) {
+        logged = true;
+        char iivCls[128] = {0};
+        themer_read_class_name(iiv, iivCls, sizeof(iivCls));
+        printf("[THEMER] iOS16 layer contents pushed iconView=0x%llx iiv=0x%llx (%s) layer=0x%llx image=0x%llx cg=0x%llx\n",
+               (unsigned long long)iconView,
+               (unsigned long long)iiv,
+               iivCls,
+               (unsigned long long)layer,
+               (unsigned long long)image,
+               (unsigned long long)cgImage);
+    }
+
+    return 4;
 }
 
 static bool themer_clear_overlay_on_object(uint64_t obj, uint64_t key)
@@ -1504,8 +1659,8 @@ static int themer_iter_iconviews(uint64_t listView,
             continue;
         }
 
-        bool dynamicOverlay = themer_should_pin_dynamic_overlay(bundle, v);
-        if (!dynamicOverlay) themer_clear_visible_override(v);
+        bool visibleOverlay = themer_should_pin_visible_overlay(bundle, v);
+        if (!visibleOverlay) themer_clear_visible_override(v);
 
         uint64_t image = themer_lookup_cached(bundle);
         if (!image) {
@@ -1521,7 +1676,7 @@ static int themer_iter_iconviews(uint64_t listView,
                 }
                 continue;
             }
-            NSData *uploadBytes = themer_rounded_png_data(pngBytes, bundle);
+            NSData *uploadBytes = themer_upload_png_data(pngBytes, bundle);
             image = themer_build_remote_uiimage_from_data(uploadBytes ?: pngBytes, bundle);
             if (!image) {
                 themer_clear_dynamic_overlay(v);
@@ -1536,7 +1691,7 @@ static int themer_iter_iconviews(uint64_t listView,
                 gThemerLogBudget--;
             }
         }
-        if (!dynamicOverlay) {
+        if (!visibleOverlay) {
             themer_clear_dynamic_overlay(v);
             if (!themer_needs_visible_push(bundle)) {
                 applied++;
@@ -1546,13 +1701,16 @@ static int themer_iter_iconviews(uint64_t listView,
 
         // Most icons persist through the model/cache pass. Dynamic/special
         // icons keep a pinned overlay because their mounted image views can
-        // redraw from private live renderers.
+        // redraw from private live renderers. iOS 16's visible SBIconView path
+        // exposes no usable image setter, so use the same overlay as a fallback.
         bool viewLevelOverlay = themer_prefers_view_level_overlay(bundle);
         (void)viewLevelOverlay;
         int rung = 0;
-        if (dynamicOverlay && themer_pin_dynamic_overlay(v, image, bundle)) {
+        if (visibleOverlay && themer_pin_dynamic_overlay(v, image, bundle)) {
             rung = 1;
-        } else if (!dynamicOverlay && themer_needs_visible_push(bundle)) {
+        } else if (themer_host_ios_major() == 16) {
+            rung = themer_push_ios16_layer_contents(v, image);
+        } else if (!visibleOverlay && themer_needs_visible_push(bundle)) {
             rung = themer_push_image(v, image);
         }
 
@@ -1639,15 +1797,15 @@ static int themer_repaint_cached_iconviews(uint64_t listView,
         uint64_t displayedRead = (r_is_objc_ptr(iiv) &&
                                   r_responds_main(iiv, "displayedImage"))
             ? r_msg2_main(iiv, "displayedImage", 0, 0, 0, 0) : 0;
-        bool dynamicOverlay = themer_should_pin_dynamic_overlay(bundle, v);
-        if (!dynamicOverlay) themer_clear_visible_override(v);
-        if (!force && !dynamicOverlay &&
+        bool visibleOverlay = themer_should_pin_visible_overlay(bundle, v);
+        if (!visibleOverlay) themer_clear_visible_override(v);
+        if (!force && !visibleOverlay &&
             overrideRead == image && displayedRead == image) {
             themer_clear_dynamic_overlay(v);
             if (skips) (*skips)++;
             continue;
         }
-        if (!dynamicOverlay) {
+        if (!visibleOverlay) {
             themer_clear_dynamic_overlay(v);
             if (!themer_needs_visible_push(bundle)) {
                 if (skips) (*skips)++;
@@ -1656,9 +1814,11 @@ static int themer_repaint_cached_iconviews(uint64_t listView,
         }
 
         int rung = 0;
-        if (dynamicOverlay && themer_pin_dynamic_overlay(v, image, bundle)) {
+        if (visibleOverlay && themer_pin_dynamic_overlay(v, image, bundle)) {
             rung = 1;
-        } else if (!dynamicOverlay && themer_needs_visible_push(bundle)) {
+        } else if (themer_host_ios_major() == 16) {
+            rung = themer_push_ios16_layer_contents(v, image);
+        } else if (!visibleOverlay && themer_needs_visible_push(bundle)) {
             rung = themer_push_image(v, image);
         }
         if (rung > 0) {
@@ -1857,7 +2017,7 @@ static int themer_graft_icon_models_for_theme(NSDictionary<NSString *, NSData *>
 
         uint64_t image = themer_lookup_cached(bundle);
         if (!image) {
-            NSData *uploadBytes = themer_rounded_png_data(pngBytes, bundle);
+            NSData *uploadBytes = themer_upload_png_data(pngBytes, bundle);
             image = themer_build_remote_uiimage_from_data(uploadBytes ?: pngBytes, bundle);
             if (!image) {
                 modelMisses++;

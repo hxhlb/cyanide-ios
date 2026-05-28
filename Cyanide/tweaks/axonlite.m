@@ -61,6 +61,15 @@ static void axn_install_crash_handler_once(void)
     printf("[AXONLITE] crash handler installed\n");
 }
 
+static int axn_host_ios_major(void)
+{
+    static int cached = -1;
+    if (cached >= 0) return cached;
+    NSString *version = UIDevice.currentDevice.systemVersion ?: @"0";
+    cached = version.intValue;
+    return cached;
+}
+
 #define AXN_TAG(fmt, ...) do { \
     snprintf(gAxonLastCallTag, sizeof(gAxonLastCallTag), fmt, ##__VA_ARGS__); \
 } while (0)
@@ -529,6 +538,26 @@ static uint64_t axn_accept_list_controller(uint64_t vc, const char *via)
     return vc;
 }
 
+static bool axn_ios16_accept_forced_list_controller(uint64_t vc)
+{
+    if (axn_host_ios_major() != 16 || !r_is_objc_ptr(vc)) return false;
+    if (axn_vc_looks_like_notification_list(vc)) return true;
+
+    char cls[96];
+    if (!axn_object_class_name(vc, cls, sizeof(cls))) snprintf(cls, sizeof(cls), "?");
+    bool classOK = strstr(cls, "Notification") ||
+                   strstr(cls, "StructuredList") ||
+                   strstr(cls, "CombinedList");
+    bool methodOK = r_responds_main(vc, "listView") ||
+                    axn_responds_sel_main(vc, AXNSelRevealNotificationHistory, "revealNotificationHistory:animated:") ||
+                    axn_responds_sel_main(vc, AXNSelRemoveNotificationRequest, "removeNotificationRequest:") ||
+                    r_responds_main(vc, "toggleFilteringForSectionIdentifier:shouldFilter:");
+    bool accept = classOK && methodOK;
+    printf("[AXONLITE] iOS16 forced CLVC probe vc=0x%llx class=%s classOK=%d methodOK=%d accept=%d\n",
+           (unsigned long long)vc, cls, classOK, methodOK, accept);
+    return accept;
+}
+
 static uint64_t axn_structured_from_combined(uint64_t combined)
 {
     if (!r_is_objc_ptr(combined)) return 0;
@@ -856,8 +885,10 @@ static uint64_t axn_force_chain_construction(void)
         r_msg2_main(clvc, "loadViewIfNeeded", 0, 0, 0, 0);
 
         gAxonCombined = combined;
-        printf("[AXONLITE] warmup: clvc=0x%llx materialized via cover-sheet chain (no lockscreen needed)\n",
-               (unsigned long long)clvc);
+        gAxonCoverSheetWindow = win;
+        printf("[AXONLITE] warmup: clvc=0x%llx materialized via cover-sheet chain window=0x%llx (no lockscreen needed)\n",
+               (unsigned long long)clvc,
+               (unsigned long long)win);
         return clvc;
     }
 
@@ -872,7 +903,8 @@ static uint64_t axn_force_chain_construction(void)
 static uint64_t axn_find_notification_list_controller(void)
 {
     if (r_is_objc_ptr(gAxonCLVC) &&
-        axn_responds_sel_main(gAxonCLVC, AXNSelAllNotificationRequests, "allNotificationRequests")) {
+        (axn_responds_sel_main(gAxonCLVC, AXNSelAllNotificationRequests, "allNotificationRequests") ||
+         axn_ios16_accept_forced_list_controller(gAxonCLVC))) {
         return gAxonCLVC;
     }
     gAxonCLVC = 0;
@@ -944,7 +976,9 @@ static uint64_t axn_find_notification_list_controller(void)
     // and the warmup short-circuits once it finds a non-zero CLVC.
     {
         uint64_t forced = axn_force_chain_construction();
-        if (r_is_objc_ptr(forced) && axn_vc_looks_like_notification_list(forced)) {
+        if (r_is_objc_ptr(forced) &&
+            (axn_vc_looks_like_notification_list(forced) ||
+             axn_ios16_accept_forced_list_controller(forced))) {
             if (gAxonCLVC != forced) {
                 gAxonModelOwnerCLVC = 0;
                 gAxonListModel = 0;

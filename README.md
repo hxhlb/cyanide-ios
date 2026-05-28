@@ -91,9 +91,12 @@ Ported from [`kolbicz/DarkSword-Tweaks`](https://github.com/kolbicz/DarkSword-Tw
 
 Tested target range:
 
-- iOS/iPadOS 17.0 through 18.7.1
+- iOS/iPadOS 16.0 through 18.7.1
 - iOS/iPadOS 26.0 through 26.0.1
 - A19/M5 devices are not supported
+
+The iOS 16 path has been tested on iOS 16.7.2. Other 16.x builds are expected
+to share the same path, but are not confirmed yet.
 
 The kernel bugs used here, `CVE-2025-43510` and `CVE-2025-43520`, were fixed in
 iOS/iPadOS 18.7.2 and 26.1. Later builds are outside this kernel exploit window.

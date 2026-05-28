@@ -609,6 +609,11 @@ static bool ota_disable_original_remote_call(void)
 {
     printf("[ota] === DISABLING OTA ===\n");
 
+    if (krw_persistence_launchd_rc_disabled()) {
+        printf("[ota] launchd RemoteCall disabled on this OS; skipping legacy OTA path\n");
+        return false;
+    }
+
     if (init_remote_call("launchd", false) != 0) {
         printf("[ota] failed to init remote call\n");
         return false;

